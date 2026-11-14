@@ -1,4 +1,7 @@
-This Repo contains all work for 2026 Innovation Hackathon for Grid Girls. To use this code, first put all of the given datasets (UNZIPPED) into our "data" folder. Then run master.R , sources all below code in the correct order to produce this Repo. 
+This Repo contains all work for 2026 Innovation Hackathon for Grid Girls. 
+
+All of our commit history is in our private Repo, which also includes the raw data. Because of the security concern of including the data directly on this Repo, right before submission we copied the contents of our private Repo without the data so that this Repo can be public and the raw data will not be accessible in the commit history. To use this code, first put all of the given datasets (UNZIPPED) into our "data" folder. Then run master.R , sources all below code in the correct order to produce this Repo. This way, the code is only reproducible for those who have access to the Challenge data. 
+
 
 Part 00: Data Cleaning
 - merge_data_frames.qmd (all code to get files in usable format, clean, and join temp data)
