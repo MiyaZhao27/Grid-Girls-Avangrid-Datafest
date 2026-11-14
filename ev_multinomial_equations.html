@@ -1,0 +1,33 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'><script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script></head><body><table class="table table-striped table-bordered table-hover" style="width: auto !important; ">
+<caption>Multinomial Logistic Regression Specification: 3-Class EV Classification</caption>
+ <thead>
+  <tr>
+   <th style="text-align:left;"> Equation Component </th>
+   <th style="text-align:left;"> Mathematical Formulation </th>
+  </tr>
+ </thead>
+<tbody>
+  <tr grouplength="2"><td colspan="2" style="border-bottom: 1px solid;"><strong>1. Log-Odds Equations (Reference = No EV)</strong></td></tr>
+<tr>
+   <td style="text-align:left;width: 220px; font-weight: bold;padding-left: 2em;" indentlevel="1"> Log-Odds: Level 1 EV vs. None </td>
+   <td style="text-align:left;"> $$\eta_{i, \text{Lvl1}} = \ln \left( \frac{P(\text{EV}_i = \text{Lvl1})}{P(\text{EV}_i = \text{None})} \right) = \beta_{0,\text{Lvl1}} + \sum_{h=2}^{24} \beta_{h,\text{Lvl1}} \text{kWh}_{ih} + \gamma_{1,\text{Lvl1}} \text{Peak}_i + \gamma_{2,\text{Lvl1}} \text{HighUse}_i + \mathbf{Z}_i^\top \boldsymbol{\delta}_{\text{Lvl1}}$$ </td>
+  </tr>
+  <tr>
+   <td style="text-align:left;width: 220px; font-weight: bold;padding-left: 2em;" indentlevel="1"> Log-Odds: Level 2 EV vs. None </td>
+   <td style="text-align:left;"> $$\eta_{i, \text{Lvl2}} = \ln \left( \frac{P(\text{EV}_i = \text{Lvl2})}{P(\text{EV}_i = \text{None})} \right) = \beta_{0,\text{Lvl2}} + \sum_{h=2}^{24} \beta_{h,\text{Lvl2}} \text{kWh}_{ih} + \gamma_{1,\text{Lvl2}} \text{Peak}_i + \gamma_{2,\text{Lvl2}} \text{HighUse}_i + \mathbf{Z}_i^\top \boldsymbol{\delta}_{\text{Lvl2}}$$ </td>
+  </tr>
+  <tr grouplength="3"><td colspan="2" style="border-bottom: 1px solid;"><strong>2. Class Probability Equations (Softmax)</strong></td></tr>
+<tr>
+   <td style="text-align:left;width: 220px; font-weight: bold;padding-left: 2em;" indentlevel="1"> Probability: No EV (Baseline) </td>
+   <td style="text-align:left;"> $$P(\text{EV}_i = \text{None}) = \frac{1}{1 + \exp(\eta_{i,\text{Lvl1}}) + \exp(\eta_{i,\text{Lvl2}})}$$ </td>
+  </tr>
+  <tr>
+   <td style="text-align:left;width: 220px; font-weight: bold;padding-left: 2em;" indentlevel="1"> Probability: Level 1 EV </td>
+   <td style="text-align:left;"> $$P(\text{EV}_i = \text{Lvl1}) = \frac{\exp(\eta_{i,\text{Lvl1}})}{1 + \exp(\eta_{i,\text{Lvl1}}) + \exp(\eta_{i,\text{Lvl2}})}$$ </td>
+  </tr>
+  <tr>
+   <td style="text-align:left;width: 220px; font-weight: bold;padding-left: 2em;" indentlevel="1"> Probability: Level 2 EV </td>
+   <td style="text-align:left;"> $$P(\text{EV}_i = \text{Lvl2}) = \frac{\exp(\eta_{i,\text{Lvl2}})}{1 + \exp(\eta_{i,\text{Lvl1}}) + \exp(\eta_{i,\text{Lvl2}})}$$ </td>
+  </tr>
+</tbody>
+</table></body></html>

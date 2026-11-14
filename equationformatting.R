@@ -1,0 +1,9 @@
+library(knitr)
+
+html <- paste0(
+  '<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>',
+  kable(data.frame(Equation = "$$\\ln\\left(\\frac{P(\\text{Class}_i = j)}{P(\\text{Class}_i = \\text{None})}\\right) = \\beta_{0j} + \\beta_{1j}\\text{Solar}_i + \\beta_{2j}\\text{HP}_i + \\beta_{3j}\\overline{\\text{kW}}_{24\\text{h},i} + \\beta_{4j}\\text{Slope}_{7\\text{--}10\\text{pm},i} + \\beta_{5j}\\text{P95Range}_i + \\beta_{6j}\\overline{\\text{Range}}_i + \\beta_{7j}\\text{SD}_{\\text{night},i} + \\beta_{8j}\\text{Spread}_{\\text{night-pk},i} + \\beta_{9j}\\text{P95}_{\\text{overnight},i}, \\quad j \\in \\{\\text{Lvl1}, \\text{Lvl2}\\}$$"), format = "html", escape = FALSE)
+)
+
+writeLines(html, "ev_eq.html")
+rstudioapi::viewer("ev_eq.html")

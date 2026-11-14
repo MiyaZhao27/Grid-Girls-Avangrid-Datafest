@@ -1,0 +1,539 @@
+---
+title: "pull_data"
+format: html
+---
+
+```{r}
+library(arrow)
+library(dplyr)
+library(ggplot2)
+
+
+if (file.exists("data/daily.rds")) {
+  daily <- readRDS("data/daily.rds")
+  message("Loaded daily.rds, skipping scan.")
+} else {
+
+  pq <- list.files("cache", pattern = "\\.parquet$", full.names = TRUE)
+  dir.create("cache_daily", showWarnings = FALSE)
+  chunks <- split(pq, ceiling(seq_along(pq) / 10))   # 10 files per chunk
+
+  t0 <- Sys.time()
+  for (k in seq_along(chunks)) {
+    out <- sprintf("cache_daily/daily_%03d.rds", k)
+    if (!file.exists(out)) {
+      chunk_ds <- open_dataset(chunks[[k]])
+
+      # Exclude 10001_20000 (uses source_file if present in cache, else CUSTOMER_NUMBER)
+      if ("source_file" %in% names(chunk_ds)) {
+        chunk_ds <- chunk_ds |>
+          filter(!grepl("2026 Avangrid Hackathon Data_10001_20000", source_file, fixed = TRUE))
+      } else {
+        chunk_ds <- chunk_ds |>
+          filter(as.numeric(CUSTOMER_NUMBER) <= 10000)
+      }
+
+      res <- chunk_ds |>
+        filter(is_complete_hour == "1") |>
+        mutate(kwh = as.numeric(hourly_kwh)) |>
+        group_by(usage_date) |>
+        summarise(total_kwh = sum(kwh, na.rm = TRUE), n_rows = n()) |>
+        collect()
+      saveRDS(res, out)
+    }
+    el <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+    cat(sprintf("[%s] chunk %d/%d (%.0f%%) | %.1f min elapsed\n",
+                format(Sys.time(), "%H:%M:%S"), k, length(chunks),
+                100 * k / length(chunks), el))
+    flush.console()
+  }
+
+  daily <- list.files("cache_daily", pattern = "\\.rds$", full.names = TRUE) |>
+    lapply(readRDS) |>
+    bind_rows() |>
+    group_by(usage_date) |>
+    summarise(total_kwh = sum(total_kwh), n_rows = sum(n_rows)) |>
+    mutate(
+      date = as.Date(usage_date),
+      avg_kwh_per_customer_hour = total_kwh / n_rows,
+      approx_customers = n_rows / 24
+    ) |>
+    arrange(date)
+
+  dir.create("data", showWarnings = FALSE)
+  saveRDS(daily, "data/daily.rds")
+}
+
+sum(is.na(daily$date))        # want 0
+range(daily$date)             # want 2025-09-01 to about 2026-08-31
+nrow(daily)                   # want ~365
+daily |> arrange(n_rows) |> head(10)
+
+# Total daily usage
+p1 <- ggplot(daily, aes(date, total_kwh)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Total daily kWh, all customers", x = NULL, y = "kWh") +
+  theme_minimal()
+
+# Average per customer-hour (fair if customer count changes)
+p2 <- ggplot(daily, aes(date, avg_kwh_per_customer_hour)) +
+  geom_col(fill = "darkorange") +
+  labs(title = "Average kWh per customer-hour, by day", x = NULL, y = "kWh") +
+  theme_minimal()
+
+# Monthly bars (cleaner for a full year)
+monthly <- daily |>
+  mutate(month = as.Date(format(date, "%Y-%m-01"))) |>
+  group_by(month) |>
+  summarise(total_kwh = sum(total_kwh), n_rows = sum(n_rows), .groups = "drop") |>
+  mutate(avg_kwh = total_kwh / n_rows)
+
+p3 <- ggplot(monthly, aes(month, avg_kwh)) +
+  geom_col(fill = "seagreen") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  labs(title = "Average kWh per customer-hour, by month", x = NULL, y = "kWh") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Customers reporting per day (coverage check)
+p4 <- ggplot(daily, aes(date, approx_customers)) +
+  geom_line() +
+  labs(title = "Approx. customers reporting per day", x = NULL, y = "Customers") +
+  theme_minimal()
+
+p1; p2; p3; p4
+
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(cli)
+library(cluster)
+library(ggplot2)
+
+# ==================================================================
+# Design
+#   * Never collect the raw 200M rows. Arrow scans the dataset, filters,
+#     casts and aggregates; only small summary tables come into R.
+#   * Work month by month. Each month is reduced to MERGEABLE aggregates
+#     (sum, count, max) per customer x day type x hour, and written to a
+#     parquet checkpoint. Means are rebuilt later as sum / n, so the
+#     result is exactly what a single big group_by would give.
+#   * Progress bar with ETA, a log file you can `tail -f`, and resume:
+#     months already checkpointed are skipped if the script is re-run.
+#
+# Assumes `ds` is an Arrow Dataset: ds <- open_dataset("path/to/data")
+# ==================================================================
+
+ckpt_dir <- "ckpt_shape"
+dir.create(file.path(ckpt_dir, "profile"), recursive = TRUE, showWarnings = FALSE)
+log_file <- file.path(ckpt_dir, "progress.log")
+
+log_msg <- function(...) {
+  line <- sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), sprintf(...))
+  cat(line, "\n", file = log_file, append = TRUE)
+}
+
+# ------------------------------------------------------------------
+# 0. Sanity check the chr columns once, on a small slice (cheap)
+# ------------------------------------------------------------------
+pq <- list.files("cache_clean", pattern = "\\.parquet$", full.names = TRUE)
+ds <- open_dataset(pq, format = "parquet")
+
+
+ds |> head(1e5) |> collect() |> count(is_complete_hour, day_type)
+# Adjust the accepted values in `complete_vals` below if yours differ.
+complete_vals <- c("TRUE", "T", "1", "Y", "YES")
+
+# ------------------------------------------------------------------
+# 1. List the months to process (reads one column only)
+# ------------------------------------------------------------------
+months <- ds |>
+  transmute(ym = substr(usage_date, 1, 7)) |>
+  distinct() |>
+  collect() |>
+  pull(ym) |>
+  sort()
+cat("Months to process:", length(months), "\n")
+
+season_of <- function(ym) {
+  m <- as.integer(substr(ym, 6, 7))
+  c("winter", "winter", "spring", "spring", "spring", "summer",
+    "summer", "summer", "fall", "fall", "fall", "winter")[m]
+}
+
+# ------------------------------------------------------------------
+# 2. Aggregate one month inside Arrow, write checkpoint
+#    Output grain: customer x day_type x hour (tiny vs the raw data)
+# ------------------------------------------------------------------
+aggregate_month <- function(ym) {
+  lo <- paste0(ym, "-01")   # usage_date is ISO text, so string range
+  hi <- paste0(ym, "-31")   # comparison works and lets Arrow prune files
+
+  out <- ds |>
+    filter(usage_date >= lo, usage_date <= hi) |>
+    filter(toupper(is_complete_hour) %in% complete_vals) |>
+    transmute(
+      CUSTOMER_NUMBER,
+      hour_ending,
+      dt  = if_else(day_type == "Weekday", "wd", "we"),
+      kwh = as.numeric(hourly_kwh)
+    ) |>
+    filter(!is.na(kwh), kwh >= 0) |>
+    group_by(CUSTOMER_NUMBER, dt, hour_ending) |>
+    summarise(
+      sum_kwh = sum(kwh),
+      n       = n(),
+      max_kwh = max(kwh),
+      hrs_gt5 = sum(if_else(kwh > 5, 1L, 0L))   # hours above 5 kW
+    ) |>
+    collect() |>
+    mutate(season = season_of(ym), ym = ym)
+
+  write_parquet(out, file.path(ckpt_dir, "profile", paste0(ym, ".parquet")))
+  invisible(sum(out$n))
+}
+
+# Time one month first to estimate total runtime:
+system.time(aggregate_month(months[1]))
+
+# ------------------------------------------------------------------
+# 3. Main loop with progress bar, ETA and resume
+# ------------------------------------------------------------------
+rows_done <- 0
+t0 <- Sys.time()
+cli_progress_bar(
+  "Aggregating",
+  total  = length(months),
+  format = paste0("{pb_spin} {pb_bar} {pb_percent} | {pb_current}/{pb_total} months",
+                  " | ETA {pb_eta} | {pb_status}")
+)
+
+for (ym in months) {
+  f <- file.path(ckpt_dir, "profile", paste0(ym, ".parquet"))
+  if (file.exists(f)) {
+    n_rows <- sum(as.numeric(read_parquet(f, col_select = "n")$n))
+    log_msg("%s skipped (checkpoint exists)", ym)
+  } else {
+    tm <- system.time(n_rows <- aggregate_month(ym))[["elapsed"]]
+    log_msg("%s done: %.1fM rows in %.0fs", ym, n_rows / 1e6, tm)
+  }
+  rows_done <- rows_done + n_rows
+  cli_progress_update(
+    status = sprintf("%s | %.1fM complete-hour rows", ym, rows_done / 1e6)
+  )
+}
+cli_progress_done()
+cat("Aggregation finished in",
+    format(round(difftime(Sys.time(), t0, units = "mins"), 1)), "\n")
+
+# ------------------------------------------------------------------
+# 4. Merge checkpoints (small: customers x ~48 hours x months)
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 4. Merge checkpoints (small: customers x ~48 hours x months)
+# ------------------------------------------------------------------
+prof <- open_dataset(file.path(ckpt_dir, "profile")) |>
+  group_by(CUSTOMER_NUMBER, season, dt, hour_ending) |>
+  summarise(
+    sum_kwh = sum(sum_kwh),
+    n       = sum(n),
+    max_kwh = max(max_kwh),
+    hrs_gt5 = sum(hrs_gt5)
+  ) |>
+  collect() |>
+  ungroup()   # collect() keeps the leftover grouping (customer, season, dt);
+              # that grouping breaks pivot_wider below, so drop it here
+ 
+cat("Profile rows:", nrow(prof), " Customers:", n_distinct(prof$CUSTOMER_NUMBER), "\n")
+ 
+# ------------------------------------------------------------------
+# 5. Keep customer-seasons with enough data, then build shape vectors
+#    shape = (mean kWh in this hour/day type) / (customer's season mean)
+#    1.0 = an average hour for that home, so size drops out.
+# ------------------------------------------------------------------
+min_hours <- 14 * 24
+
+season_stats <- prof |>
+  group_by(CUSTOMER_NUMBER, season) |>
+  summarise(season_hours = sum(n), season_sum = sum(sum_kwh), .groups = "drop") |>
+  filter(season_hours >= min_hours, season_sum > 0) |>
+  mutate(season_mean = season_sum / season_hours)
+
+shape_wide <- prof |>
+  inner_join(season_stats, by = c("CUSTOMER_NUMBER", "season")) |>
+  mutate(
+    shape = (sum_kwh / n) / season_mean,
+    feat  = sprintf("%s_%s_h%02d", season, dt, hour_ending)
+  ) |>
+  select(CUSTOMER_NUMBER, feat, shape) |>
+  pivot_wider(names_from = feat, values_from = shape) |>
+  drop_na()
+
+ids <- shape_wide$CUSTOMER_NUMBER
+X   <- as.matrix(shape_wide[, -1])
+rownames(X) <- ids
+cat("Clustering", nrow(X), "customers on", ncol(X), "features\n")
+
+# ------------------------------------------------------------------
+# 6. PCA (no scaling: features already share a unitless scale)
+# ------------------------------------------------------------------
+pca  <- prcomp(X, center = TRUE, scale. = FALSE)
+n_pc <- which(cumsum(pca$sdev^2) / sum(pca$sdev^2) >= 0.90)[1]
+Z    <- pca$x[, 1:n_pc, drop = FALSE]
+cat("Using", n_pc, "PCs (90% variance)\n")
+
+# ------------------------------------------------------------------
+# 7. Choose k (silhouette on a sample, since it is O(n^2))
+# ------------------------------------------------------------------
+set.seed(42)
+samp   <- sample(nrow(Z), min(3000, nrow(Z)))
+d_samp <- dist(Z[samp, , drop = FALSE])
+
+ks <- 2:10
+eval_k <- lapply(ks, function(k) {
+  km  <- kmeans(Z, centers = k, nstart = 10, iter.max = 100)
+  sil <- silhouette(km$cluster[samp], d_samp)
+  log_msg("k=%d silhouette=%.3f", k, mean(sil[, 3]))
+  tibble(k = k, tot_withinss = km$tot.withinss, sil = mean(sil[, 3]))
+}) |> bind_rows()
+
+print(eval_k)
+ggplot(eval_k, aes(k, sil)) + geom_line() + geom_point() + labs(title = "Average silhouette")
+ggplot(eval_k, aes(k, tot_withinss)) + geom_line() + geom_point() + labs(title = "Elbow")
+
+# ------------------------------------------------------------------
+# 8. Final clustering
+#    For millions of customers, ClusterR::MiniBatchKmeans is a drop-in
+#    faster option. Plain kmeans is fine for tens/hundreds of thousands.
+# ------------------------------------------------------------------
+k_final <- 6
+set.seed(42)
+km <- kmeans(Z, centers = k_final, nstart = 25, iter.max = 100)
+assign <- tibble(CUSTOMER_NUMBER = ids, cluster = factor(km$cluster))
+print(assign |> count(cluster) |> mutate(pct = round(n / sum(n), 3)))
+
+# Cross-check with Ward hierarchical on a sample (full dist matrix would
+# not fit in memory at this scale)
+hc_idx <- sample(nrow(Z), min(5000, nrow(Z)))
+hc     <- hclust(dist(Z[hc_idx, , drop = FALSE]), method = "ward.D2")
+print(table(kmeans = km$cluster[hc_idx], ward = cutree(hc, k = k_final)))
+
+# ------------------------------------------------------------------
+# 9. Plot centroid shapes, computed from the aggregates (no raw data)
+# ------------------------------------------------------------------
+shape_long <- prof |>
+  inner_join(season_stats, by = c("CUSTOMER_NUMBER", "season")) |>
+  mutate(shape = (sum_kwh / n) / season_mean) |>
+  inner_join(assign, by = "CUSTOMER_NUMBER")
+
+shape_long |>
+  group_by(cluster, season, dt, hour_ending) |>
+  summarise(mean_shape = mean(shape),
+            lo = quantile(shape, 0.25),
+            hi = quantile(shape, 0.75), .groups = "drop") |>
+  ggplot(aes(hour_ending, mean_shape)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2) +
+  geom_line() +
+  facet_grid(cluster ~ season + dt) +
+  labs(y = "Load relative to customer's mean (1 = average hour)",
+       title = "Cluster centroid shapes (line) with IQR (band)")
+
+# ------------------------------------------------------------------
+# 10. Volume and BESS-relevant metrics (exact, from the same aggregates)
+# ------------------------------------------------------------------
+volume <- prof |>
+  group_by(CUSTOMER_NUMBER) |>
+  summarise(
+    mean_kw        = sum(sum_kwh) / sum(n),
+    peak_kw        = max(max_kwh),
+    load_factor    = mean_kw / peak_kw,
+    sys_peak_share = sum(sum_kwh[hour_ending %in% 17:20]) / sum(sum_kwh),
+    pct_hrs_gt5kw  = sum(hrs_gt5) / sum(n),
+    .groups = "drop"
+  )
+
+cluster_profile <- assign |>
+  left_join(volume, by = "CUSTOMER_NUMBER") |>
+  group_by(cluster) |>
+  summarise(n = n(),
+            across(c(mean_kw, peak_kw, load_factor, sys_peak_share, pct_hrs_gt5kw), median),
+            .groups = "drop")
+print(cluster_profile)
+
+# Save results
+saveRDS(list(assign = assign, volume = volume, pca = pca, km = km,
+             cluster_profile = cluster_profile),
+        file.path(ckpt_dir, "shape_clustering_results.rds"))
+```
+
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ==================================================================
+# Run AFTER shape_clustering_large.R, in the same R session. Uses these
+# objects it created: shape_long, season_stats, assign, cluster_profile.
+# (shape_long is only built in section 9 of that script; re-run that
+#  block if it is missing.)
+#
+# hour_ending = the hour that ENDS at that time, so 17 = 4pm-5pm.
+# ==================================================================
+
+# ------------------------------------------------------------------
+# 1. Centroids: mean normalized shape per cluster x season x day type
+#    (1.0 = the customer's own average hour)
+# ------------------------------------------------------------------
+cent <- shape_long |>
+  group_by(cluster, season, dt, hour_ending) |>
+  summarise(shape = mean(shape), .groups = "drop")
+
+cent_avg <- cent |>                      # averaged over seasons
+  group_by(cluster, dt, hour_ending) |>
+  summarise(shape = mean(shape), .groups = "drop")
+
+# Cluster labels that include size, e.g. "3 (n=4,382, 14%)"
+sizes <- assign |> count(cluster) |> mutate(pct = n / sum(n))
+lab   <- setNames(sprintf("Cluster %s (n=%s, %.0f%%)", sizes$cluster,
+                          format(sizes$n, big.mark = ","), 100 * sizes$pct),
+                  sizes$cluster)
+
+# ------------------------------------------------------------------
+# 2. Plots
+# ------------------------------------------------------------------
+# (a) Overall daily shape, weekday vs weekend
+p_overall <- ggplot(cent_avg, aes(hour_ending, shape, colour = dt)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(16.5, 20.5), linetype = "dashed", colour = "grey60") +
+  facet_wrap(~cluster, labeller = labeller(cluster = lab)) +
+  scale_colour_manual(values = c(wd = "#1f77b4", we = "#ff7f0e"),
+                      labels = c(wd = "Weekday", we = "Weekend"), name = NULL) +
+  scale_x_continuous(breaks = seq(0, 24, 6)) +
+  labs(x = "Hour ending", y = "Load relative to own average (1 = average hour)",
+       title = "Cluster centroid shapes",
+       subtitle = "Dashed lines mark the 4-8pm system peak window") +
+  theme_minimal()
+print(p_overall)
+
+# (b) Weekday shape by season: shows heating / cooling / seasonal behavior
+p_season <- cent |>
+  filter(dt == "wd") |>
+  ggplot(aes(hour_ending, shape, colour = season)) +
+  geom_line() +
+  facet_wrap(~cluster, labeller = labeller(cluster = lab)) +
+  scale_x_continuous(breaks = seq(0, 24, 6)) +
+  labs(x = "Hour ending", y = "Relative load", title = "Weekday centroids by season") +
+  theme_minimal()
+print(p_season)
+
+ggsave("centroids_overall.png", p_overall, width = 11, height = 7, dpi = 200)
+ggsave("centroids_season.png",  p_season,  width = 11, height = 7, dpi = 200)
+
+# ------------------------------------------------------------------
+# 3. Numbers behind the shapes (cluster-level descriptors)
+# ------------------------------------------------------------------
+time_window <- function(h) case_when(
+  h %in% 7:9   ~ "morning",    # 6am-9am
+  h %in% 10:16 ~ "midday",     # 9am-4pm
+  h %in% 17:21 ~ "evening",    # 4pm-9pm
+  TRUE         ~ "overnight"   # 9pm-6am
+)
+
+# Peak hour and peak-to-trough ratio
+peaks <- cent_avg |>
+  group_by(cluster, dt) |>
+  summarise(peak_hr = hour_ending[which.max(shape)],
+            peak_ratio = max(shape) / min(shape), .groups = "drop") |>
+  pivot_wider(names_from = dt, values_from = c(peak_hr, peak_ratio))
+
+# Share of daily energy in each window
+shares <- cent_avg |>
+  mutate(win = time_window(hour_ending)) |>
+  group_by(cluster, dt) |>
+  mutate(tot = sum(shape)) |>
+  group_by(cluster, dt, win) |>
+  summarise(share = sum(shape) / first(tot), .groups = "drop") |>
+  pivot_wider(names_from = c(win, dt), values_from = share,
+              names_glue = "{win}_share_{dt}")
+
+# Weekday vs weekend similarity (low = routine differs on weekends)
+wdwe <- cent_avg |>
+  pivot_wider(names_from = dt, values_from = shape) |>
+  group_by(cluster) |>
+  summarise(wd_we_cor = cor(wd, we), .groups = "drop")
+
+# Seasonal level: median season mean kW, winter vs summer
+seas <- season_stats |>
+  inner_join(assign, by = "CUSTOMER_NUMBER") |>
+  group_by(cluster, season) |>
+  summarise(m = median(season_mean), .groups = "drop") |>
+  pivot_wider(names_from = season, values_from = m)
+
+seas$winter_summer <- if (all(c("winter", "summer") %in% names(seas))) {
+  seas$winter / seas$summer
+} else NA_real_
+
+desc <- cluster_profile |>
+  left_join(peaks,  by = "cluster") |>
+  left_join(shares, by = "cluster") |>
+  left_join(wdwe,   by = "cluster") |>
+  left_join(select(seas, cluster, any_of(c("winter", "summer")), winter_summer),
+            by = "cluster")
+
+# ------------------------------------------------------------------
+# 4. DRAFT one-line labels from transparent rules
+#    The clusters look alike in volume, so thresholds are RELATIVE
+#    (compared with the other clusters). Edit these after looking at
+#    the plots; treat the output as a starting point, not a finding.
+# ------------------------------------------------------------------
+desc <- desc |>
+  mutate(
+    when = case_when(
+      peak_hr_wd %in% 6:9    ~ "morning-peaking",
+      peak_hr_wd %in% 10:16  ~ "midday-peaking",
+      peak_hr_wd %in% 17:22  ~ "evening-peaking",
+      TRUE                   ~ "overnight-peaking"
+    ),
+    spiky     = if_else(peak_ratio_wd >= quantile(peak_ratio_wd, 2/3), "spiky", NA_character_),
+    flat      = if_else(peak_ratio_wd <= quantile(peak_ratio_wd, 1/3), "flat",  NA_character_),
+    weekend   = if_else(wd_we_cor    <= quantile(wd_we_cor, 1/3), "weekend routine differs", NA_character_),
+    wfh       = if_else(midday_share_wd >= quantile(midday_share_wd, 2/3), "high daytime use", NA_character_),
+    season_tag = case_when(
+      is.na(winter_summer)   ~ NA_character_,
+      winter_summer >= 1.15  ~ "winter-heavy",
+      winter_summer <= 0.87  ~ "summer-heavy",
+      TRUE                   ~ NA_character_
+    )
+  ) |>
+  rowwise() |>
+  mutate(draft_label = paste(na.omit(c(when, spiky, flat, wfh, weekend, season_tag)),
+                             collapse = ", ")) |>
+  ungroup()
+
+# Readable summary table
+desc |>
+  transmute(
+    cluster, n,
+    peak_weekday   = sprintf("%d:00-%d:00", peak_hr_wd - 1, peak_hr_wd),
+    peak_ratio_wd  = round(peak_ratio_wd, 2),
+    evening_share  = round(evening_share_wd, 3),
+    midday_share   = round(midday_share_wd, 3),
+    overnight_share = round(overnight_share_wd, 3),
+    wd_we_cor      = round(wd_we_cor, 3),
+    winter_summer  = round(winter_summer, 2),
+    sys_peak_share = round(sys_peak_share, 3),
+    pct_hrs_gt5kw  = round(pct_hrs_gt5kw, 3),
+    draft_label
+  ) |>
+  print(width = Inf)
+
+# Save for the write-up
+saveRDS(desc, file.path(ckpt_dir, "cluster_descriptions.rds"))
+
+```

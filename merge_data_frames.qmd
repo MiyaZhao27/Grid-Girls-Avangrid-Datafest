@@ -1,0 +1,182 @@
+---
+title: "merge_data_frames"
+format: html
+---
+
+### NEW DATA LOAD
+
+```{r}
+library(arrow)
+library(dplyr)
+library(ggplot2)
+
+# 1. LOAD & CLEAN WEATHER DATA
+weather <- read.csv("data/Weather Data_Avangrid_Hackathon (Sheet1).csv", sep = ";", header = TRUE)
+
+weather_clean <- weather |>
+  mutate(
+    usage_date  = format(as.Date(date, format = "%d/%m/%Y"), "%Y-%m-%d"),
+    hour_ending = as.integer(sub(":.*", "", as.character(time))) + 1L,
+    temp        = as.numeric(temp),
+    humidity    = as.numeric(humidity),
+    windspeed   = as.numeric(windspeed)
+  ) |>
+  select(usage_date, hour_ending, temp, humidity, windspeed) |>
+  distinct(usage_date, hour_ending, .keep_all = TRUE)
+
+weather_arrow <- as_arrow_table(weather_clean)
+
+
+# 2. CONVERT ALL 4 CSV FOLDERS + MERGE WEATHER -> FINAL PARQUETS (cache_clean)
+folders <- c(
+  "data/2026 Avangrid Hackathon Data_1_10000",
+  "data/2026 Avangrid Hackathon Data_10001_20000_v2",
+  "data/2026 Avangrid Hackathon Data_20001_30000",
+  "data/2026 Avangrid Hackathon Data_30001_35725"
+)
+
+out_dir  <- "cache_clean"
+log_file <- file.path(out_dir, "load_log.txt")
+dir.create(out_dir, showWarnings = FALSE)
+
+t0 <- Sys.time()
+trace <- function(...) {
+  msg <- sprintf("[%s | %5.1f min] %s", format(Sys.time(), "%H:%M:%S"),
+                 as.numeric(difftime(Sys.time(), t0, units = "mins")), sprintf(...))
+  cat(msg, "\n"); cat(msg, "\n", file = log_file, append = TRUE); flush.console()
+}
+
+files <- unlist(lapply(folders, list.files, pattern = "\\.csv$",
+                       full.names = TRUE, recursive = TRUE))
+stopifnot("No CSV files found—check folder paths." = length(files) > 0)
+
+sizes <- file.size(files)
+trace("Found %d CSVs, %.2f GB total, median %.1f KB",
+      length(files), sum(sizes) / 1e9, median(sizes) / 1e3)
+
+nms <- names(open_csv_dataset(files[1]))
+sch <- schema(setNames(rep(list(utf8()), length(nms)), nms))
+
+done_bytes <- 0; total_bytes <- sum(sizes)
+t_start <- Sys.time()
+
+for (i in seq_along(files)) {
+  marker <- file.path(out_dir, sprintf("file_%04d.done", i))
+  if (file.exists(marker)) { done_bytes <- done_bytes + sizes[i]; next }
+
+  ok <- tryCatch({
+    open_csv_dataset(files[i], schema = sch, skip = 1) |>
+      mutate(hour_ending = as.integer(hour_ending)) |>
+      left_join(weather_arrow, by = c("usage_date", "hour_ending")) |>
+      write_dataset(
+        out_dir,
+        format = "parquet",
+        compression = "zstd",
+        basename_template = sprintf("file_%04d-{i}.parquet", i)
+      )
+    file.create(marker); TRUE
+  }, error = function(e) {
+    trace("File %d FAILED (%s): %s", i, basename(files[i]), conditionMessage(e))
+    FALSE
+  })
+
+  done_bytes <- done_bytes + sizes[i]
+  rate <- done_bytes / as.numeric(difftime(Sys.time(), t_start, units = "secs"))
+  trace("File %d/%d %s | %.1f%% | ETA %.1f min", i, length(files),
+        if (ok) "ok" else "FAILED", 100 * done_bytes / total_bytes,
+        (total_bytes - done_bytes) / rate / 60)
+}
+
+# 3. LOAD FINAL DATASET & VERIFY CUSTOMERS + COLUMNS
+pq <- list.files("cache_clean", pattern = "\\.parquet$", full.names = TRUE)
+ds <- open_dataset(pq, format = "parquet")
+trace("Dataset ready: %d rows x %d cols", nrow(ds), ncol(ds))
+
+head(ds) |> collect()
+
+cust_counts <- ds |>
+  count(CUSTOMER_NUMBER) |>
+  collect() |>
+  mutate(CUSTOMER_NUMBER = as.numeric(CUSTOMER_NUMBER)) |>
+  arrange(CUSTOMER_NUMBER)
+
+nrow(cust_counts)          # Total distinct customers (should be ~35,725)
+summary(cust_counts$n)     # Distribution of hourly rows per customer
+head(cust_counts, 10)
+tail(cust_counts, 10)
+
+
+# 4. BUILD & SAVE DAILY SUMMARY (data/daily.rds)
+daily <- ds |>
+  filter(is_complete_hour == "1") |>
+  mutate(kwh = as.numeric(hourly_kwh)) |>
+  group_by(usage_date) |>
+  summarise(total_kwh = sum(kwh, na.rm = TRUE), n_rows = n()) |>
+  collect() |>
+  mutate(
+    date = as.Date(usage_date),
+    avg_kwh_per_customer_hour = total_kwh / n_rows,
+    approx_customers = n_rows / 24
+  ) |>
+  arrange(date)
+
+dir.create("data", showWarnings = FALSE)
+saveRDS(daily, "data/daily.rds")
+
+# Sanity checks
+sum(is.na(daily$date))     # want 0
+range(daily$date)          # want 2025-09-01 to ~2026-08-31
+nrow(daily)                # want ~365
+daily |> arrange(n_rows) |> head(10)
+```
+
+```{r}
+
+library(dplyr)
+
+# 1. Exact vector of missing customer numbers from 1 to 35,725
+missing_ids <- setdiff(1:35725, cust_counts$CUSTOMER_NUMBER)
+length(missing_ids)
+head(missing_ids, 50)
+
+# 2. Group consecutive missing IDs into contiguous ranges (start_id to end_id)
+missing_ranges <- tibble(id = missing_ids) |>
+  mutate(gap_group = cumsum(c(TRUE, diff(id) > 1))) |>
+  group_by(gap_group) |>
+  summarise(
+    start_id  = min(id),
+    end_id    = max(id),
+    n_missing = n(),
+    .groups   = "drop"
+  ) |>
+  select(-gap_group)
+
+# Largest contiguous gaps first (a block of 100–1,000+ indicates a missing CSV batch)
+missing_ranges |>
+  arrange(desc(n_missing)) |>
+  print(n = 30)
+
+# 3. Missing count broken down by the 4 folder ranges
+tibble(id = 1:35725) |>
+  mutate(
+    present = id %in% cust_counts$CUSTOMER_NUMBER,
+    folder_bucket = case_when(
+      id <= 10000 ~ "1_10000",
+      id <= 20000 ~ "10001_20000_v2",
+      id <= 30000 ~ "20001_30000",
+      TRUE        ~ "30001_35725"
+    )
+  ) |>
+  group_by(folder_bucket) |>
+  summarise(
+    expected = n(),
+    present  = sum(present),
+    missing  = sum(!present),
+    .groups  = "drop"
+  )
+
+# 4. Sanity check: any IDs in ds that are NA or outside 1:35725?
+cust_counts |>
+  filter(is.na(CUSTOMER_NUMBER) | !CUSTOMER_NUMBER %in% 1:35725)
+
+```

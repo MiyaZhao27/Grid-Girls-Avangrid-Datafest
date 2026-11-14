@@ -1,0 +1,40 @@
+# Data
+
+- hourly AMI data
+- hourly weather data
+- spreadsheet of most likely EV, heat pump, and solar pv customers
+
+# Challenge
+
+# Part 1
+
+- identify likely customers for (EV charging, air conditioning, electric heating, swimming pools, hot tubs, solar/battery combinations, any other segments)
+- use their labeled likely customers to fit a predictive model, train and validate, then use to classify our data
+- model observed load by some baseline level of usage and then look for different patterns (using weather as predictors)
+  - use this to extract features (i.e., overnight usage, etc)
+  - Let's each pick one to look at
+
+
+- make df summary for each user (max, time of day of max, all this by season, average daily load, average )
+# Part 2
+
+- develop customer segments based on consumer patterns
+Examples may include:
+• High electrification customers (EV, heat pump, solar PV)
+• Peak demand contributors (e.g., swimming pools, hot tubs, AC)
+• Seasonal customers (only in some seasons)
+• Flexible load customers (ask in OH what this means)
+• Customers likely to adopt new technologies (ev, heat pump, solar)
+• Emerging electrification candidates ()
+
+- do some additional data analysis, but also take some results from part 1 (clustering, PCA, DA) # Part 3
+- look for customers with persistent peak demand or limited available capacity
+
+# Deliverables notes
+
+- look at sample bill to see cost breakdown
+
+
+# questions for OH
+- what are flexible load customers
+- what is limited available capacity
